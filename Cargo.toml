@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["multipart"] }
+axum = { version = "0.7", features = ["multipart", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.5", features = ["cors", "trace", "limit"] }
@@ -19,6 +19,9 @@ thiserror = "1.0"
 
 # Image processing
 image = { version = "0.25", features = ["jpeg", "png", "webp"] }
+pdf = "0.9.0"  # สำหรับอ่าน PDF
+lopdf = "0.33"  # สำหรับ merge PDF
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 # rayon = "1.10"         # <- ถ้าไม่ได้ใช้ parallel processing จริง ให้ลบทิ้งหรือคงคอมเมนต์นี้ไว้
 
 # Env (.env loader)
@@ -38,3 +41,6 @@ chrono = { version = "0.4", features = ["serde"] }
 urlencoding = "2.1"
 webp = "0.3"
 dashmap = "5"
+
+# HTTP client (if needed for other purposes)
+# reqwest = { version = "0.11", features = ["json"] }

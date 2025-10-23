@@ -1,0 +1,6 @@
+# Python dependencies for ShopImage API
+pypdf>=4.0.0         # PDF merging
+rembg[cpu]>=2.0.0    # Background removal (CPU version)
+onnxruntime>=1.19.0  # Required by rembg
+pillow>=10.0.0       # Image processing
+
