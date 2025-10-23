@@ -1355,6 +1355,84 @@ async fn convert_pdf(
                 return (StatusCode::BAD_REQUEST, "File is not a PDF").into_response();
             }
 
+            // ✅ คำนวณ PDF hash สำหรับ cache key
+            let pdf_hash = calculate_file_hash(&data);
+            let pdf_data = data.to_vec(); // เก็บข้อมูล PDF สำหรับ cache
+            eprintln!("📄 PDF hash: {}", pdf_hash);
+
+            // ✅ เช็ค cache ก่อน (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                eprintln!("🔍 Checking PDF-all cache...");
+                match redis.get_cached_pdf_all_result(&pdf_hash).await {
+                    Ok(Some(cached_result)) => {
+                        eprintln!("🎯 PDF-all cache HIT! Using cached result");
+                        // ✅ Cache hit! ส่งผลลัพธ์จาก cache
+                        let qr = st.quota.try_consume(&user_id, 1, &plan);
+                        if !qr.allowed {
+                            let body = serde_json::json!({
+                                "ok": false,
+                                "error": qr.message.as_deref().unwrap_or("quota exceeded"),
+                                "quota": {
+                                    "plan": qr.plan,
+                                    "remaining_day": qr.remaining_day,
+                                    "remaining_month": qr.remaining_month
+                                }
+                            });
+                            let mut resp =
+                                (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                            add_quota_headers(&mut resp, &qr);
+                            return resp;
+                        }
+
+                        // สร้าง download URL สำหรับ cached result
+                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                        let filename = format!("cached_{}", cached_result.filename);
+                        let blob_path = format!("output/{}/{}", today, filename);
+
+                        let blob_client = container_client.blob_client(&blob_path);
+                        if let Err(e) = blob_client
+                            .put_block_blob(cached_result.data.clone())
+                            .content_type(&cached_result.content_type)
+                            .into_future()
+                            .await
+                        {
+                            eprintln!("upload error: {e:?}");
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "Upload error")
+                                .into_response();
+                        }
+
+                        let download_url = format!("{}/dl/{}", api_base(), encode(&blob_path));
+
+                        let mut resp = Json(ConvertResp {
+                            ok: true,
+                            filename,
+                            size_kb: cached_result.size_kb,
+                            download_url,
+                            download_url_array: None,
+                            quota: QuotaPayload {
+                                plan: qr.plan.clone(),
+                                remaining_day: qr.remaining_day,
+                                remaining_month: qr.remaining_month,
+                            },
+                        })
+                        .into_response();
+                        add_quota_headers(&mut resp, &qr);
+                        return resp;
+                    }
+                    Ok(None) => {
+                        eprintln!("💭 PDF-all cache MISS! Processing PDF...");
+                        // Cache miss, ต้องประมวลผลใหม่
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Redis error: {}", e);
+                        eprintln!("💭 PDF-all cache ERROR! Processing PDF...");
+                        // Continue with normal processing
+                    }
+                }
+            } else {
+                eprintln!("💭 No Redis cache available! Processing PDF...");
+            }
+
             // แปลง PDF เป็นรูปภาพทุกหน้า
             let temp_dir = std::env::temp_dir();
             let temp_pdf = temp_dir.join("temp.pdf");
@@ -1442,6 +1520,24 @@ async fn convert_pdf(
 
             if download_urls.is_empty() {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "No pages generated").into_response();
+            }
+
+            // ✅ Cache ผลลัพธ์ (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                eprintln!("💾 Caching PDF-all result...");
+                // สร้าง dummy result สำหรับ cache (เนื่องจาก PDF-all ส่ง array ของ URLs)
+                let cache_result = CacheResult {
+                    data: pdf_data.clone(), // เก็บ PDF ต้นฉบับ
+                    content_type: "application/pdf".to_string(),
+                    filename: format!("pdf_all_{}.pdf", Uuid::new_v4()),
+                    size_kb: pdf_data.len() as u64 / 1024,
+                };
+
+                if let Err(e) = redis.cache_pdf_all_result(&pdf_hash, &cache_result).await {
+                    eprintln!("⚠️  Failed to cache PDF-all result: {}", e);
+                } else {
+                    eprintln!("✅ PDF-all result cached successfully!");
+                }
             }
 
             // ลบไฟล์ชั่วคราว
@@ -1542,6 +1638,84 @@ async fn convert_pdf_all(
                 return (StatusCode::BAD_REQUEST, "File is not a PDF").into_response();
             }
 
+            // ✅ คำนวณ PDF hash สำหรับ cache key
+            let pdf_hash = calculate_file_hash(&data);
+            let pdf_data = data.to_vec(); // เก็บข้อมูล PDF สำหรับ cache
+            eprintln!("📄 PDF hash: {}", pdf_hash);
+
+            // ✅ เช็ค cache ก่อน (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                eprintln!("🔍 Checking PDF-all cache...");
+                match redis.get_cached_pdf_all_result(&pdf_hash).await {
+                    Ok(Some(cached_result)) => {
+                        eprintln!("🎯 PDF-all cache HIT! Using cached result");
+                        // ✅ Cache hit! ส่งผลลัพธ์จาก cache
+                        let qr = st.quota.try_consume(&user_id, 1, &plan);
+                        if !qr.allowed {
+                            let body = serde_json::json!({
+                                "ok": false,
+                                "error": qr.message.as_deref().unwrap_or("quota exceeded"),
+                                "quota": {
+                                    "plan": qr.plan,
+                                    "remaining_day": qr.remaining_day,
+                                    "remaining_month": qr.remaining_month
+                                }
+                            });
+                            let mut resp =
+                                (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                            add_quota_headers(&mut resp, &qr);
+                            return resp;
+                        }
+
+                        // สร้าง download URL สำหรับ cached result
+                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                        let filename = format!("cached_{}", cached_result.filename);
+                        let blob_path = format!("output/{}/{}", today, filename);
+
+                        let blob_client = container_client.blob_client(&blob_path);
+                        if let Err(e) = blob_client
+                            .put_block_blob(cached_result.data.clone())
+                            .content_type(&cached_result.content_type)
+                            .into_future()
+                            .await
+                        {
+                            eprintln!("upload error: {e:?}");
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "Upload error")
+                                .into_response();
+                        }
+
+                        let download_url = format!("{}/dl/{}", api_base(), encode(&blob_path));
+
+                        let mut resp = Json(ConvertResp {
+                            ok: true,
+                            filename,
+                            size_kb: cached_result.size_kb,
+                            download_url,
+                            download_url_array: None,
+                            quota: QuotaPayload {
+                                plan: qr.plan.clone(),
+                                remaining_day: qr.remaining_day,
+                                remaining_month: qr.remaining_month,
+                            },
+                        })
+                        .into_response();
+                        add_quota_headers(&mut resp, &qr);
+                        return resp;
+                    }
+                    Ok(None) => {
+                        eprintln!("💭 PDF-all cache MISS! Processing PDF...");
+                        // Cache miss, ต้องประมวลผลใหม่
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Redis error: {}", e);
+                        eprintln!("💭 PDF-all cache ERROR! Processing PDF...");
+                        // Continue with normal processing
+                    }
+                }
+            } else {
+                eprintln!("💭 No Redis cache available! Processing PDF...");
+            }
+
             // แปลง PDF เป็นรูปภาพทุกหน้า
             let temp_dir = std::env::temp_dir();
             let temp_pdf = temp_dir.join("temp.pdf");
@@ -1629,6 +1803,24 @@ async fn convert_pdf_all(
 
             if download_urls.is_empty() {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "No pages generated").into_response();
+            }
+
+            // ✅ Cache ผลลัพธ์ (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                eprintln!("💾 Caching PDF-all result...");
+                // สร้าง dummy result สำหรับ cache (เนื่องจาก PDF-all ส่ง array ของ URLs)
+                let cache_result = CacheResult {
+                    data: pdf_data.clone(), // เก็บ PDF ต้นฉบับ
+                    content_type: "application/pdf".to_string(),
+                    filename: format!("pdf_all_{}.pdf", Uuid::new_v4()),
+                    size_kb: pdf_data.len() as u64 / 1024,
+                };
+
+                if let Err(e) = redis.cache_pdf_all_result(&pdf_hash, &cache_result).await {
+                    eprintln!("⚠️  Failed to cache PDF-all result: {}", e);
+                } else {
+                    eprintln!("✅ PDF-all result cached successfully!");
+                }
             }
 
             // ลบไฟล์ชั่วคราว
