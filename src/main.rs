@@ -715,6 +715,70 @@ async fn remove_background(
 
         eprintln!("  🎨 Border: {} px, Color: {}", border_size, border_color);
 
+        // ✅ คำนวณ file hash สำหรับ cache key
+        let file_hash = calculate_file_hash(&data);
+
+        // ✅ เช็ค cache ก่อน (ถ้ามี Redis)
+        if let Some(redis) = &st.redis {
+            match redis
+                .get_cached_remove_bg_result(&file_hash, border_size, border_color)
+                .await
+            {
+                Ok(Some(cached_result)) => {
+                    // ✅ Cache hit! ส่งผลลัพธ์จาก cache
+                    let qr = st.quota.try_consume(&user_id, 1, &plan);
+                    if !qr.allowed {
+                        let body = serde_json::json!({
+                            "ok": false,
+                            "error": qr.message.unwrap_or_else(|| "Quota exceeded".to_string())
+                        });
+                        return (StatusCode::FORBIDDEN, Json(body)).into_response();
+                    }
+
+                    // สร้าง download URL สำหรับ cached result
+                    let today = Utc::now().format("%Y-%m-%d").to_string();
+                    let filename = format!("cached_{}", cached_result.filename);
+                    let blob_path = format!("output/{}/{}", today, filename);
+
+                    let blob_client = container_client.blob_client(&blob_path);
+                    if let Err(e) = blob_client
+                        .put_block_blob(cached_result.data.clone())
+                        .content_type(&cached_result.content_type)
+                        .into_future()
+                        .await
+                    {
+                        eprintln!("upload error: {e:?}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "Upload error").into_response();
+                    }
+
+                    let download_url = format!("{}/dl/{}", api_base(), encode(&blob_path));
+
+                    let mut resp = Json(ConvertResp {
+                        ok: true,
+                        filename,
+                        size_kb: cached_result.size_kb,
+                        download_url,
+                        download_url_array: None,
+                        quota: QuotaPayload {
+                            plan: qr.plan.clone(),
+                            remaining_day: qr.remaining_day,
+                            remaining_month: qr.remaining_month,
+                        },
+                    })
+                    .into_response();
+                    add_quota_headers(&mut resp, &qr);
+                    return resp;
+                }
+                Ok(None) => {
+                    // Cache miss, ต้องประมวลผลใหม่
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Redis error: {}", e);
+                    // Continue with normal processing
+                }
+            }
+        }
+
         // ลบพื้นหลังด้วย Python script
         let output_data = match remove_bg_with_python(&data, border_size, border_color) {
             Ok(data) => data,
@@ -727,6 +791,28 @@ async fn remove_background(
                     .into_response();
             }
         };
+
+        // ✅ Cache ผลลัพธ์ (ถ้ามี Redis)
+        if let Some(redis) = &st.redis {
+            let cache_result = CacheResult {
+                data: output_data.clone(),
+                content_type: "image/png".to_string(),
+                filename: format!(
+                    "nobg_{}_{}.png",
+                    filename
+                        .trim_end_matches(&['.', 'j', 'p', 'g', 'J', 'P', 'G', 'n', 'e', 'w'][..]),
+                    Uuid::new_v4()
+                ),
+                size_kb: output_data.len() as u64 / 1024,
+            };
+
+            if let Err(e) = redis
+                .cache_remove_bg_result(&file_hash, border_size, border_color, &cache_result)
+                .await
+            {
+                eprintln!("⚠️  Failed to cache remove-bg result: {}", e);
+            }
+        }
 
         // อัปโหลดผลลัพธ์
         let today = Utc::now().format("%Y-%m-%d").to_string();
