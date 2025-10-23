@@ -374,6 +374,80 @@ impl UpstashRedis {
             }
         }
     }
+
+    // Cache functions for convert-pdf endpoint
+    pub async fn cache_pdf_result(
+        &self,
+        pdf_hash: &str,
+        page: u32,
+        result: &CacheResult,
+    ) -> Result<(), String> {
+        let cache_key = format!("pdf:{}:{}", pdf_hash, page);
+        let ttl_seconds = 7200; // 2 hours
+
+        let cache_data = serde_json::json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(&result.data),
+            "content_type": result.content_type,
+            "filename": result.filename,
+            "size_kb": result.size_kb,
+        });
+
+        self.set(&cache_key, &cache_data.to_string(), ttl_seconds)
+            .await
+            .map_err(|e| format!("Failed to cache PDF result: {}", e))?;
+
+        println!("✅ PDF result cached with key: {}", cache_key);
+        Ok(())
+    }
+
+    pub async fn get_cached_pdf_result(
+        &self,
+        pdf_hash: &str,
+        page: u32,
+    ) -> Result<Option<CacheResult>, String> {
+        let cache_key = format!("pdf:{}:{}", pdf_hash, page);
+
+        match self.get(&cache_key).await {
+            Ok(cached_data) => {
+                let cache_data: serde_json::Value = serde_json::from_str(&cached_data)
+                    .map_err(|e| format!("Failed to parse cached PDF data: {}", e))?;
+
+                let data = cache_data
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing data field")?;
+
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| format!("Failed to decode cached PDF data: {}", e))?;
+
+                let result = CacheResult {
+                    data,
+                    content_type: cache_data
+                        .get("content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("image/jpeg")
+                        .to_string(),
+                    filename: cache_data
+                        .get("filename")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("cached_pdf.jpg")
+                        .to_string(),
+                    size_kb: cache_data
+                        .get("size_kb")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                };
+
+                println!("🎯 PDF cache hit for key: {}", cache_key);
+                Ok(Some(result))
+            }
+            Err(_) => {
+                println!("💭 PDF cache miss for key: {}", cache_key);
+                Ok(None)
+            }
+        }
+    }
 }
 
 pub fn calculate_file_hash(data: &[u8]) -> String {

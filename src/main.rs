@@ -1362,10 +1362,10 @@ async fn convert_pdf(
 
             // ✅ เช็ค cache ก่อน (ถ้ามี Redis)
             if let Some(redis) = &st.redis {
-                eprintln!("🔍 Checking PDF-all cache...");
-                match redis.get_cached_pdf_all_result(&pdf_hash).await {
+                eprintln!("🔍 Checking PDF cache...");
+                match redis.get_cached_pdf_result(&pdf_hash, 1).await {
                     Ok(Some(cached_result)) => {
-                        eprintln!("🎯 PDF-all cache HIT! Using cached result");
+                        eprintln!("🎯 PDF cache HIT! Using cached result");
                         // ✅ Cache hit! ส่งผลลัพธ์จาก cache
                         let qr = st.quota.try_consume(&user_id, 1, &plan);
                         if !qr.allowed {
@@ -1420,12 +1420,12 @@ async fn convert_pdf(
                         return resp;
                     }
                     Ok(None) => {
-                        eprintln!("💭 PDF-all cache MISS! Processing PDF...");
+                        eprintln!("💭 PDF cache MISS! Processing PDF...");
                         // Cache miss, ต้องประมวลผลใหม่
                     }
                     Err(e) => {
                         eprintln!("⚠️  Redis error: {}", e);
-                        eprintln!("💭 PDF-all cache ERROR! Processing PDF...");
+                        eprintln!("💭 PDF cache ERROR! Processing PDF...");
                         // Continue with normal processing
                     }
                 }
@@ -1524,7 +1524,7 @@ async fn convert_pdf(
 
             // ✅ Cache ผลลัพธ์ (ถ้ามี Redis)
             if let Some(redis) = &st.redis {
-                eprintln!("💾 Caching PDF-all result...");
+                eprintln!("💾 Caching PDF result...");
                 // สร้าง dummy result สำหรับ cache (เนื่องจาก PDF-all ส่ง array ของ URLs)
                 let cache_result = CacheResult {
                     data: pdf_data.clone(), // เก็บ PDF ต้นฉบับ
@@ -1533,10 +1533,10 @@ async fn convert_pdf(
                     size_kb: pdf_data.len() as u64 / 1024,
                 };
 
-                if let Err(e) = redis.cache_pdf_all_result(&pdf_hash, &cache_result).await {
-                    eprintln!("⚠️  Failed to cache PDF-all result: {}", e);
+                if let Err(e) = redis.cache_pdf_result(&pdf_hash, 1, &cache_result).await {
+                    eprintln!("⚠️  Failed to cache PDF result: {}", e);
                 } else {
-                    eprintln!("✅ PDF-all result cached successfully!");
+                    eprintln!("✅ PDF result cached successfully!");
                 }
             }
 
