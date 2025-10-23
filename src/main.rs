@@ -12,6 +12,7 @@ mod image_ops;
 mod presets;
 mod quota;
 mod rate_limit;
+mod upstash_redis;
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -43,6 +44,7 @@ use azure_storage_blobs::prelude::*;
 use lopdf::Document;
 
 // Redis caching
+use upstash_redis::{calculate_file_hash, CacheResult, UpstashRedis};
 
 // ---------- serde helper: ค่าว่าง ("") -> None และ parse เป็นตัวเลข ----------
 use serde::de::Deserializer;
@@ -126,7 +128,8 @@ fn parse_u32_opt(s: Option<&str>) -> Option<u32> {
 
 #[derive(Clone)]
 struct AppState {
-    quota: Arc<quota::Quota>,          // โควตาต่อ user/ip
+    quota: Arc<quota::Quota>,         // โควตาต่อ user/ip
+    redis: Option<Arc<UpstashRedis>>, // Redis cache
 }
 
 // -------------------- App / Main --------------------
@@ -160,9 +163,26 @@ fn app() -> Router {
     let rl_state =
         rate_limit::RateLimitState::new_with_lock(limit_per_min, lock_secs > 0, lock_secs);
 
+    // ✅ สร้าง Redis connection
+    let redis = match UpstashRedis::new() {
+        Ok(redis) => {
+            println!(
+                "🔗 Connecting to Upstash Redis: {}",
+                std::env::var("UPSTASH_REDIS_REST_URL").unwrap_or_default()
+            );
+            Some(Arc::new(redis))
+        }
+        Err(e) => {
+            println!("⚠️  Redis connection failed: {}", e);
+            println!("⚠️  Running without Redis cache");
+            None
+        }
+    };
+
     // ✅ สร้าง AppState (Quota memory + Redis cache)
     let state = AppState {
         quota: Arc::new(quota::Quota::new()),
+        redis,
     };
 
     // เส้นที่ต้อง rate-limit (ต่อ IP)
@@ -191,6 +211,19 @@ fn app() -> Router {
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
+
+    // ✅ Test Redis connection ก่อนเริ่ม server
+    if let Ok(redis) = UpstashRedis::new() {
+        if let Err(e) = redis.test_connection().await {
+            println!("❌ Redis connection failed: {}", e);
+            println!("⚠️  Running without Redis cache");
+        } else {
+            println!("✅ Redis connection successful");
+        }
+    } else {
+        println!("⚠️  Redis not configured, running without cache");
+    }
+
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -445,6 +478,80 @@ async fn convert(
                 Err(_) => return (StatusCode::BAD_REQUEST, "Invalid file").into_response(),
             };
 
+            // ✅ คำนวณ file hash สำหรับ cache key
+            let file_hash = calculate_file_hash(&data);
+
+            // ✅ เช็ค cache ก่อน (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                match redis
+                    .get_cached_image_result(&file_hash, target_w, target_h, output_format)
+                    .await
+                {
+                    Ok(Some(cached_result)) => {
+                        // ✅ Cache hit! ส่งผลลัพธ์จาก cache
+                        let qr = st.quota.try_consume(&user_id, 1, &plan);
+                        if !qr.allowed {
+                            let body = serde_json::json!({
+                                "ok": false,
+                                "error": qr.message.as_deref().unwrap_or("quota exceeded"),
+                                "quota": {
+                                    "plan": qr.plan,
+                                    "remaining_day": qr.remaining_day,
+                                    "remaining_month": qr.remaining_month
+                                }
+                            });
+                            let mut resp =
+                                (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+                            add_quota_headers(&mut resp, &qr);
+                            return resp;
+                        }
+
+                        // สร้าง download URL สำหรับ cached result
+                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                        let filename = format!("cached_{}", cached_result.filename);
+                        let blob_path = format!("output/{}/{}", today, filename);
+
+                        let blob_client = container_client.blob_client(&blob_path);
+                        if let Err(e) = blob_client
+                            .put_block_blob(cached_result.data.clone())
+                            .content_type(&cached_result.content_type)
+                            .into_future()
+                            .await
+                        {
+                            eprintln!("upload error: {e:?}");
+                            return (StatusCode::INTERNAL_SERVER_ERROR, "Upload error")
+                                .into_response();
+                        }
+
+                        let download_url = format!("{}/dl/{}", api_base(), encode(&blob_path));
+
+                        let mut resp = Json(ConvertResp {
+                            ok: true,
+                            filename,
+                            size_kb: cached_result.size_kb,
+                            download_url,
+                            download_url_array: None,
+                            quota: QuotaPayload {
+                                plan: qr.plan.clone(),
+                                remaining_day: qr.remaining_day,
+                                remaining_month: qr.remaining_month,
+                            },
+                        })
+                        .into_response();
+
+                        add_quota_headers(&mut resp, &qr);
+                        return resp;
+                    }
+                    Ok(None) => {
+                        // Cache miss, ต้องประมวลผลใหม่
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Redis error: {}", e);
+                        // Continue with normal processing
+                    }
+                }
+            }
+
             // โหลดรูป (รองรับ HEIC จาก iPhone)
             let img = match load_image_with_heic_support(&data) {
                 Ok(i) => i,
@@ -490,6 +597,29 @@ async fn convert(
                     }
                 },
             };
+
+            // ✅ Cache ผลลัพธ์ (ถ้ามี Redis)
+            if let Some(redis) = &st.redis {
+                let cache_result = CacheResult {
+                    data: buf.clone(),
+                    content_type: content_type.to_string(),
+                    filename: format!("{}.{}", Uuid::new_v4(), ext),
+                    size_kb: buf.len() as u64 / 1024,
+                };
+
+                if let Err(e) = redis
+                    .cache_image_result(
+                        &file_hash,
+                        target_w,
+                        target_h,
+                        output_format,
+                        &cache_result,
+                    )
+                    .await
+                {
+                    eprintln!("⚠️  Failed to cache result: {}", e);
+                }
+            }
 
             // 6) อัปโหลดขึ้น Blob
             let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -1225,8 +1355,7 @@ async fn convert_pdf(
             }
 
             if download_urls.is_empty() {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "No pages generated")
-                    .into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, "No pages generated").into_response();
             }
 
             // ลบไฟล์ชั่วคราว
